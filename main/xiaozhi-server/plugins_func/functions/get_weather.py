@@ -113,9 +113,27 @@ WEATHER_CODE_MAP = {
 
 async def fetch_city_info(location, api_key, api_host):
     url = f"https://{api_host}/geo/v2/city/lookup?key={api_key}&location={location}&lang=zh"
-    async with httpx.AsyncClient(timeout=httpx.Timeout(5.0, connect=3.0)) as client:
-        response = await client.get(url, headers=HEADERS)
-    data = response.json()
+    # StackChan (2026-10-22): 原 response.json() 在 host 错误/返回非 JSON 时直接抛
+    # "Expecting value: line 1 column 1 (char 0)", 异常文本被 TTS 播报。
+    # 改为完整记录日志并返回 None, 由上层给出友好提示。
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(5.0, connect=3.0)) as client:
+            response = await client.get(url, headers=HEADERS)
+    except Exception as e:
+        logger.bind(tag=TAG).error(f"天气API请求失败 (host={api_host}): {e}")
+        return None
+    if response.status_code != 200:
+        logger.bind(tag=TAG).error(
+            f"天气API返回 HTTP {response.status_code} (host={api_host}), body: {response.text[:200]}"
+        )
+        return None
+    try:
+        data = response.json()
+    except Exception:
+        logger.bind(tag=TAG).error(
+            f"天气API返回非JSON, 大概率 api_host 配置错误 (host={api_host}), body: {response.text[:200]}"
+        )
+        return None
     if data.get("error") is not None:
         logger.bind(tag=TAG).error(
             f"获取天气失败，原因：{data.get('error', {}).get('detail')}"
@@ -201,7 +219,9 @@ async def get_weather(conn: "ConnectionHandler", location: str = None, lang: str
     city_info = await fetch_city_info(location, api_key, api_host)
     if not city_info:
         return ActionResponse(
-            Action.REQLLM, f"未找到相关的城市: {location}，请确认地点是否正确", None
+            Action.REQLLM,
+            f"暂时查不到 {location} 的天气（天气服务不可用或城市名无法识别），请告知用户天气服务暂时不可用，请稍后再试",
+            None,
         )
     soup = await fetch_weather_page(city_info["fxLink"])
     if not soup:

@@ -98,8 +98,20 @@ class ToolManager:
             return result
 
         except Exception as e:
-            self.logger.error(f"执行工具 {tool_name} 时出错: {e}")
-            return ActionResponse(action=Action.ERROR, response=str(e))
+            # StackChan (2026-10-22): 原先把 str(e) 直接返回, 会被 TTS 播报原始异常
+            # (如 "Expecting value: line 1 column 1 (char 0)")。改为完整记录日志、
+            # 只给用户友好提示, 具体错误让大模型根据 response 里的内部提示自行组织语言。
+            import traceback
+            self.logger.error(
+                f"执行工具 {tool_name} 时出错: {e}\n{traceback.format_exc()}"
+            )
+            self.logger.bind(tag=__name__).error(
+                f"工具 {tool_name} 异常已拦截, 不向用户播报原始错误: {e}"
+            )
+            return ActionResponse(
+                action=Action.ERROR,
+                response=f"抱歉，{tool_name} 功能暂时不可用，请稍后再试",
+            )
 
     def get_supported_tool_names(self) -> List[str]:
         """获取所有支持的工具名称"""
