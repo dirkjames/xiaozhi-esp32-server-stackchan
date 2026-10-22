@@ -13,16 +13,23 @@ class AudioRateController:
     解决高并发下的时间累积误差问题
     """
 
-    def __init__(self, frame_duration=60, send_delay=0):
+    def __init__(self, frame_duration=60, send_delay=0, max_ahead_ms=1500):
         """
         Args:
             frame_duration: 单个音频帧时长（毫秒），默认60ms
             send_delay: 自定义发送间隔（毫秒）。
                         0 = 按 frame_duration 节奏发；
                         >0 = 按 send_delay 节奏发（主线程不入队延迟，无预缓冲）
+            max_ahead_ms: 下发允许领先虚拟播放时钟的最大毫秒数。
+                        弱网治理：作为断流恢复后的回填预算（帧数按此换算），
+                        0 = 严格实时节奏（旧行为）
         """
         # 流控间隔（毫秒）：send_delay > 0 时用配置值，否则用 frame_duration
         self.interval_ms = send_delay if send_delay > 0 else frame_duration
+        # 弱网回填预算（帧数）：首句/断流恢复时允许连续发送的帧数，
+        # 用完即回严格实时节奏，防止 TCP 管道积压引发重传风暴
+        self.burst_budget = 0
+        self.max_ahead_ms = max_ahead_ms
         self.queue = deque()
         self.play_position = 0  # 虚拟播放位置（毫秒）
         self.start_timestamp = None  # 开始时间戳（只读，不修改）
@@ -57,8 +64,12 @@ class AudioRateController:
             # 只有间隔超过1帧时长，才认为是真正的"暂停恢复"
             if elapsed_since_empty >= self.interval_ms:
                 self.start_timestamp = time.monotonic() - (self.play_position / 1000)
+                # 断流超过 2s 视为真断流：发放回填预算（最多 max_ahead_ms），
+                # 恢复端侧缓冲存货；句间快速衔接不发放，避免持续超速灌满 TCP 管道
+                if elapsed_since_empty > 2000:
+                    self.burst_budget = max(1, self.max_ahead_ms // self.interval_ms)
                 self.logger.bind(tag=TAG).debug(
-                    f"队列从空恢复，重置时间戳，当前播放位置: {self.play_position}ms，间隔: {elapsed_since_empty:.0f}ms"
+                    f"队列从空恢复，重置时间戳，当前播放位置: {self.play_position}ms，间隔: {elapsed_since_empty:.0f}ms，回填预算: {self.burst_budget}帧"
                 )
 
         self.queue.append(("audio", opus_packet))
@@ -116,17 +127,28 @@ class AudioRateController:
             elif item_type == "audio":
                 if self.start_timestamp is None:
                     self.start_timestamp = time.monotonic()
+                    # 首次发送：发放回填预算，把端侧缓冲预先填到 max_ahead_ms（弱网存货）
+                    self.burst_budget = max(1, self.max_ahead_ms // self.interval_ms)
 
                 _, opus_packet = item
 
                 # 循环等待直到时间到达
+                # 弱网治理（StackChan 2026-10-21 实测教训）：
+                # 禁止"落后无限追赶"——弱链路上 burst 十几秒音频会灌满 TCP 管道，
+                # 积压数据引发重传风暴，连接半死 60s+（设备实测 62s 无数据）。
+                # 改为定量回填：只有回填预算（首句/断流>2s 恢复时发放，
+                # 共 max_ahead_ms 时长的帧数）允许连续发，预算用完立即回到严格实时节奏。
                 while True:
+                    if self.burst_budget > 0:
+                        self.burst_budget -= 1
+                        break
+
                     # 计算时间差
                     elapsed_ms = self._get_elapsed_ms()
                     output_ms = self.play_position
 
                     if elapsed_ms < output_ms:
-                        # 还不到发送时间，计算等待时长
+                        # 领先于实时时钟，计算等待时长
                         wait_ms = output_ms - elapsed_ms
 
                         # 等待后继续检查（允许被中断）
@@ -137,7 +159,7 @@ class AudioRateController:
                             raise
                         # 等待结束后重新检查时间（循环回到 while True）
                     else:
-                        # 时间已到，跳出等待循环
+                        # 已落后或刚好实时节奏，跳出等待循环
                         break
 
                 # 时间已到，从队列移除并发送

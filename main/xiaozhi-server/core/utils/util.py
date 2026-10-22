@@ -440,6 +440,14 @@ def pcm_to_data_stream(raw_data, is_opus=True, callback: Callable[[Any], Any] = 
             frame_data = chunk if isinstance(chunk, bytes) else bytes(chunk)
             callback(frame_data)
 
+    # 输出音频实际时长，用于排查 TTS 合成异常（如长静音/内容异常导致端侧"卡住"）
+    from config.logger import setup_logging
+    total_frames = (len(raw_data) + frame_size * 2 - 1) // (frame_size * 2)
+    setup_logging().bind(tag=TAG).info(
+        f"PCM→{'Opus' if is_opus else 'PCM'}流式转换完成: {total_frames}帧, "
+        f"时长≈{total_frames * frame_duration / 1000:.1f}s, sample_rate={sample_rate}"
+    )
+
 
 def opus_datas_to_wav_bytes(opus_datas, sample_rate=16000, channels=1):
     """

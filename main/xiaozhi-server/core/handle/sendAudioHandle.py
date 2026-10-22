@@ -8,6 +8,7 @@ if TYPE_CHECKING:
     from core.connection import ConnectionHandler
 from core.utils import textUtils
 from core.utils.util import audio_to_data
+from core.utils import opus_encoder_utils
 from core.providers.tts.dto.dto import SentenceType
 from core.utils.audioRateController import AudioRateController
 
@@ -16,6 +17,32 @@ TAG = __name__
 AUDIO_FRAME_DURATION = 60
 # 预缓冲包数量，直接发送以减少延迟
 PRE_BUFFER_COUNT = 5
+
+
+def _generate_silence_frames(conn, duration_ms=300):
+    """生成尾部静音垫 opus 帧（StackChan 2026-10-21，genie-voice 同款做法）。
+
+    TTS 结束时补一小段静音，防止端侧播放缓冲在 stop 消息到达前被清空产生
+    尾部 underrun（咔咔声/截断）。用临时编码器按连接采样率编码全零 PCM，
+    任何异常都降级为不补（不影响正常流程）。
+    """
+    try:
+        frame_ms = AUDIO_FRAME_DURATION
+        sample_rate = conn.sample_rate
+        frame_pcm_bytes = int(sample_rate * frame_ms / 1000) * 2  # 16bit mono
+        n_frames = max(1, duration_ms // frame_ms)
+        encoder = opus_encoder_utils.OpusEncoderUtils(
+            sample_rate=sample_rate, channels=1, frame_size_ms=frame_ms
+        )
+        frames = []
+        encoder.encode_pcm_to_opus_stream(
+            b"\x00" * (frame_pcm_bytes * n_frames), True, frames.append
+        )
+        conn.logger.bind(tag=TAG).info(f"尾部静音垫已生成: {len(frames)}帧, sample_rate={sample_rate}")
+        return frames
+    except Exception as e:
+        conn.logger.bind(tag=TAG).warning(f"生成尾部静音帧失败，跳过静音垫: {e}")
+        return []
 
 
 async def sendAudioMessage(conn: "ConnectionHandler", sentenceType, audios, text, sentence_id=None):
@@ -188,7 +215,10 @@ def _get_or_create_rate_controller(
         # 创建或获取 rate_controller
         if not hasattr(conn, "audio_rate_controller"):
             conn.audio_rate_controller = AudioRateController(
-                frame_duration, send_delay=send_delay_ms
+                frame_duration,
+                send_delay=send_delay_ms,
+                # 允许领先实时最多 max_ahead_ms：首句/断流恢复时突发回填端侧缓冲（弱网卡死治理）
+                max_ahead_ms=conn.config.get("tts_audio_max_ahead_ms", 1500),
             )
         else:
             conn.audio_rate_controller.reset()
@@ -260,6 +290,57 @@ async def _send_audio_with_rate_control(
                 rate_controller.add_audio(packet)
 
 
+def _update_send_stats(conn: "ConnectionHandler", nbytes: int, cost_ms: float):
+    """
+    音频帧发送统计（StackChan 弱网卡死诊断用）：
+    每 5 秒窗口汇总一次帧数/字节数/write 耗时；单次 write 超过 1s 立即告警。
+    若服务端 write 顺畅但设备侧无音频 → 问题在链路/设备接收侧；
+    若 write 频繁阻塞数百 ms 以上 → 服务端到设备的 TCP 通道拥塞。
+    """
+    stats = getattr(conn, "audio_send_stats", None)
+    now = time.monotonic()
+    if stats is None:
+        stats = {
+            "window_start": now,
+            "frames": 0,
+            "bytes": 0,
+            "max_cost_ms": 0.0,
+            "total_cost_ms": 0.0,
+            "slow_1s": 0,
+            "slow_500ms": 0,
+        }
+        conn.audio_send_stats = stats
+
+    stats["frames"] += 1
+    stats["bytes"] += nbytes
+    stats["total_cost_ms"] += cost_ms
+    if cost_ms > stats["max_cost_ms"]:
+        stats["max_cost_ms"] = cost_ms
+    if cost_ms > 1000:
+        stats["slow_1s"] += 1
+        conn.logger.bind(tag=TAG).warning(
+            f"WS音频write阻塞 {cost_ms:.0f}ms (bytes={nbytes}) - TCP发送缓冲已满或链路拥塞"
+        )
+    elif cost_ms > 500:
+        stats["slow_500ms"] += 1
+
+    window = now - stats["window_start"]
+    if window >= 5.0:
+        avg = stats["total_cost_ms"] / max(1, stats["frames"])
+        conn.logger.bind(tag=TAG).info(
+            f"WS音频发送统计[{window:.1f}s]: {stats['frames']}帧 {stats['bytes']}B "
+            f"平均write={avg:.1f}ms 最大write={stats['max_cost_ms']:.0f}ms "
+            f">500ms:{stats['slow_500ms']}次 >1s:{stats['slow_1s']}次"
+        )
+        stats["window_start"] = now
+        stats["frames"] = 0
+        stats["bytes"] = 0
+        stats["max_cost_ms"] = 0.0
+        stats["total_cost_ms"] = 0.0
+        stats["slow_1s"] = 0
+        stats["slow_500ms"] = 0
+
+
 async def _do_send_audio(conn: "ConnectionHandler", opus_packet, flow_control):
     """
     执行实际的音频发送
@@ -273,8 +354,11 @@ async def _do_send_audio(conn: "ConnectionHandler", opus_packet, flow_control):
         timestamp = int(start_time * 1000) % (2**32)
         await _send_to_mqtt_gateway(conn, opus_packet, timestamp, sequence)
     else:
-        # 直接发送opus数据包
+        # 直接发送opus数据包（StackChan 2026-10-21 加发送耗时统计：区分服务端write阻塞 vs 链路问题）
+        t0 = time.perf_counter()
         await conn.websocket.send(opus_packet)
+        cost_ms = (time.perf_counter() - t0) * 1000
+        _update_send_stats(conn, len(opus_packet), cost_ms)
 
     # 更新流控状态
     flow_control["packet_count"] = packet_index + 1
@@ -291,6 +375,10 @@ async def send_tts_message(conn: "ConnectionHandler", state, text=None):
 
     # TTS播放结束
     if state == "stop":
+        # 尾部静音垫：先入队，排在最后一段音频之后，防止端侧尾部 underrun
+        silence_frames = _generate_silence_frames(conn)
+        if silence_frames:
+            await sendAudio(conn, silence_frames)
         # 保存当前的 sentence_id，用于后续判断是否是当前轮次
         current_sentence_id = conn.sentence_id
         # 播放提示音

@@ -32,6 +32,9 @@ class ASRProvider(ASRProviderBase):
         self.model = config.get("model", "paraformer-realtime-v2")
         self.sample_rate = config.get("sample_rate", 16000)
         self.format = config.get("format", "pcm")
+        # 网关地址可配置：qwen-audio-3.1-asr-flash-streaming 等新模型推荐 workspace 专属域名
+        # wss://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference
+        self.ws_url = config.get("ws_url", "wss://dashscope.aliyuncs.com/api-ws/v1/inference")
 
         # 可选参数
         self.vocabulary_id = config.get("vocabulary_id")
@@ -43,9 +46,9 @@ class ASRProvider(ASRProviderBase):
         self.multi_threshold_mode_enabled = config.get("multi_threshold_mode_enabled", False)
         self.punctuation_prediction_enabled = config.get("punctuation_prediction_enabled", True)
         self.inverse_text_normalization_enabled = config.get("inverse_text_normalization_enabled", True)
-
-        # WebSocket URL
-        self.ws_url = "wss://dashscope.aliyuncs.com/api-ws/v1/inference"
+        # qwen-audio-3.1-asr-flash-streaming 专属可选参数
+        self.vad_model = config.get("vad_model")  # near_meeting_16k(近场) / far_field_meeting_16k(远场,默认)
+        self.keep_dialect = config.get("keep_dialect", False)
 
         self.output_dir = config.get("output_dir", "./audio_output")
         self.delete_audio_file = delete_audio_file
@@ -120,6 +123,30 @@ class ASRProvider(ASRProviderBase):
 
     def _build_run_task_message(self) -> dict:
         """构建run-task指令"""
+        # 参数按模型家族区分：paraformer 与 qwen-audio-3.1-asr-flash-streaming 支持的参数集不同，
+        # 未知参数可能导致 task-failed，不能混发
+        params = {
+            "format": self.format,
+            "sample_rate": self.sample_rate,
+        }
+        if self.model.startswith("qwen-audio"):
+            params["max_sentence_silence"] = self.max_sentence_silence
+            params["multi_threshold_mode_enabled"] = self.multi_threshold_mode_enabled
+            if self.vad_model:
+                params["vad_model"] = self.vad_model
+            if self.keep_dialect:
+                params["keep_dialect"] = True
+        else:
+            # paraformer 系列参数
+            params.update({
+                "disfluency_removal_enabled": self.disfluency_removal_enabled,
+                "semantic_punctuation_enabled": self.semantic_punctuation_enabled,
+                "max_sentence_silence": self.max_sentence_silence,
+                "multi_threshold_mode_enabled": self.multi_threshold_mode_enabled,
+                "punctuation_prediction_enabled": self.punctuation_prediction_enabled,
+                "inverse_text_normalization_enabled": self.inverse_text_normalization_enabled,
+            })
+
         message = {
             "header": {
                 "action": "run-task",
@@ -131,22 +158,13 @@ class ASRProvider(ASRProviderBase):
                 "task": "asr",
                 "function": "recognition",
                 "model": self.model,
-                "parameters": {
-                    "format": self.format,
-                    "sample_rate": self.sample_rate,
-                    "disfluency_removal_enabled": self.disfluency_removal_enabled,
-                    "semantic_punctuation_enabled": self.semantic_punctuation_enabled,
-                    "max_sentence_silence": self.max_sentence_silence,
-                    "multi_threshold_mode_enabled": self.multi_threshold_mode_enabled,
-                    "punctuation_prediction_enabled": self.punctuation_prediction_enabled,
-                    "inverse_text_normalization_enabled": self.inverse_text_normalization_enabled,
-                },
+                "parameters": params,
                 "input": {}
             }
         }
 
-        # 只有当模型名称以v2结尾时才添加vocabulary_id参数
-        if self.model.lower().endswith("v2"):
+        # 热词：v2 系列与 qwen-audio 系列都支持 vocabulary_id，仅配置了才传
+        if self.vocabulary_id and (self.model.lower().endswith("v2") or self.model.startswith("qwen-audio")):
             message["payload"]["parameters"]["vocabulary_id"] = self.vocabulary_id
 
         if self.language_hints:

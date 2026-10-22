@@ -78,7 +78,14 @@ class WebSocketServer:
             host,
             port,
             process_request=self._http_response,
-            ping_interval=None,
+            # StackChan 2026-10-21 弱网卡死治理：
+            # 1. 关闭 permessage-deflate（websockets 库默认开启）：opus 数据不可压缩，
+            #    压缩只增加 CPU 与延迟变量；genie-voice(uvicorn/pipecat) 同链路不卡，无压缩。
+            # 2. 开启 keepalive ping（原 ping_interval=None）：对齐 uvicorn 默认 20s，
+            #    弱网下保活 NAT/中间设备映射，坏链路 20s 内快速暴露而非静默挂死 60s+。
+            compression=None,
+            ping_interval=20,
+            ping_timeout=20,
         ):
             await asyncio.Future()
 
